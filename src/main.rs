@@ -1,10 +1,16 @@
 use std::path::{Path, PathBuf};
 
+use clap::Parser;
 use crates_index::{Crate, IndexConfig, Version};
 use futures::stream::StreamExt;
 use reqwest::Client;
-use tokio::{fs::{remove_file, self}, runtime::Runtime, io::AsyncReadExt};
-use clap::Parser;
+
+use tokio::{
+    fs::{self, remove_file},
+    io::AsyncReadExt,
+    runtime::Runtime,
+    sync::mpsc::{channel, Receiver, Sender},
+};
 
 /// Simple downloader to mirror crates.io
 #[derive(Parser, Debug)]
@@ -24,7 +30,8 @@ struct Config {
 }
 
 fn main() -> Result<(), Error> {
-    let config = Config::parse();
+    let mut config = Config::parse();
+    config.concurrency = config.concurrency.min(1);
 
     let index = crates_index::Index::new_cargo_default()?;
     let rt = Runtime::new().unwrap();
@@ -38,21 +45,24 @@ fn main() -> Result<(), Error> {
             api: None,
         };
 
+        let (file_tx, file_rx) = channel(config.concurrency);
+        tokio::spawn(scribe(config.dest.clone(), file_rx));
+
         let gets = tokio_stream::iter(
             index
                 .crates()
-                .map(|crate_| download_crate(&config, &client, crate_, &index_config)),
+                .map(|crate_| download_crate(&config, &client, crate_, &index_config, &file_tx)),
         )
         .buffer_unordered(config.concurrency)
         .count();
+
         gets.await;
     });
 
     Ok(())
 }
 
-#[derive(Debug)]
-#[derive(thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("hash did not match")]
     Hash,
@@ -64,6 +74,42 @@ pub enum Error {
     Index(#[from] crates_index::Error),
     #[error("could not build url")]
     Url,
+    #[error("channel shut down")]
+    Channel,
+}
+
+/// A single routine for handling file writes.
+async fn scribe(dest: PathBuf, mut rx: Receiver<(Version, Vec<u8>)>) -> Result<(), Error> {
+    // create the dest folder if needed
+    fs::create_dir_all(&dest).await?;
+
+    let mut file_path = dest.clone();
+
+    loop {
+        // take a buffer off the queue
+        let (crate_, bytes) = match rx.recv().await {
+            None => return Ok(()),
+            Some(file) => file,
+        };
+
+        // create the crate folder
+        file_path.push(crate_.name());
+        fs::create_dir_all(&file_path).await?;
+
+        // create filename
+        file_path.push(format!(
+            "{crate}-{version}.crate",
+            crate = crate_.name(),
+            version = crate_.version()
+        ));
+
+        // write crate to file
+        fs::write(&file_path, &bytes).await?;
+
+        // pop both path nodes
+        file_path.pop();
+        file_path.pop();
+    }
 }
 
 async fn download_crate(
@@ -71,6 +117,7 @@ async fn download_crate(
     client: &Client,
     crate_: Crate,
     index_config: &IndexConfig,
+    file_write: &Sender<(Version, Vec<u8>)>,
 ) -> Result<(), Error> {
     // configure the url schema
 
@@ -122,8 +169,11 @@ async fn download_crate(
             continue;
         }
 
-        // write crate to file
-        fs::write(&file_path, &bytes).await?;
+        // TODO: send message on channel
+        file_write
+            .send((version.clone(), bytes))
+            .await
+            .map_err(|_| Error::Channel)?;
 
         // restore file_path before next loop
         file_path.pop();
@@ -137,7 +187,7 @@ async fn download_single_version(
     version: &Version,
     index_config: &IndexConfig,
 ) -> Result<Vec<u8>, Error> {
-    let url = version.download_url(&index_config).ok_or(Error::Url)?;
+    let url = version.download_url(index_config).ok_or(Error::Url)?;
     Ok(client.get(&url).send().await?.bytes().await?.to_vec())
 }
 
