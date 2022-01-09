@@ -10,7 +10,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[clap(about, version)]
 struct Config {
-    /// Local destination folder for crates.io mirror
+    /// Local destination folder to store crates.io crate files and index archive
     #[clap(short, long)]
     dest: PathBuf,
 
@@ -18,17 +18,53 @@ struct Config {
     #[clap(long)]
     dont_check_local_hashes: bool,
 
+    /// Include yanked crates in mirror
+    #[clap(long)]
+    download_yanked_crates: bool,
+
     /// Concurrency factor. The number of concurrent downloads
     #[clap(short, long, default_value_t = 25)]
     concurrency: usize,
 }
 
+impl Config {
+    fn crates_dir(&self) -> PathBuf {
+        let mut crates = self.dest.clone();
+        crates.push("crates");
+        crates
+    }
+
+    fn index_archive_file(&self) -> PathBuf {
+        let mut index = self.dest.clone();
+        index.push("index.tar.gz");
+        index
+    }
+}
+
 fn main() -> Result<(), Error> {
+    // parse command line args
     let config = Config::parse();
 
-    let index = crates_index::Index::new_cargo_default()?;
-    let rt = Runtime::new().unwrap();
+    // initialize crates.io index and update local copy
+    let mut index = crates_index::Index::new_cargo_default()?;
+    index.update()?;
 
+    // archive the index to the desired path
+    let index_saved = std::process::Command::new("tar")
+        .args([
+            "czf",
+            &config.index_archive_file().to_str().expect("non-UTF-8 in destination path"),
+            index.path().to_str().expect("non-UTF-8 in index path"),
+        ])
+        .status()?
+        .success();
+
+    if !index_saved {
+        return Err(Error::SaveIndex);
+    }
+
+    // start archiving crates
+    let rt = Runtime::new().unwrap();
     rt.block_on(async move {
         let client = Client::new();
 
@@ -64,6 +100,10 @@ pub enum Error {
     Index(#[from] crates_index::Error),
     #[error("could not build url")]
     Url,
+    #[error("http status unsuccessful")]
+    HttpStatus,
+    #[error("error saving index as tar.gz archive")]
+    SaveIndex,
 }
 
 async fn download_crate(
@@ -72,15 +112,18 @@ async fn download_crate(
     crate_: Crate,
     index_config: &IndexConfig,
 ) -> Result<(), Error> {
-    // configure the url schema
-
     // create the crate's folder
-    let mut crate_dir = config.dest.clone();
+    let mut crate_dir = config.crates_dir();
     crate_dir.push(crate_.name());
     fs::create_dir_all(&crate_dir).await?;
 
     let mut file_path = crate_dir;
     for version in crate_.versions() {
+        // skip downloading yanked versions unless specifically requested
+        if version.is_yanked() && !config.download_yanked_crates {
+            continue;
+        }
+
         // create filename
         file_path.push(format!(
             "{crate}-{version}.crate",
@@ -138,7 +181,12 @@ async fn download_single_version(
     index_config: &IndexConfig,
 ) -> Result<Vec<u8>, Error> {
     let url = version.download_url(&index_config).ok_or(Error::Url)?;
-    Ok(client.get(&url).send().await?.bytes().await?.to_vec())
+    let response = client.get(&url).send().await?;
+    if response.status().is_success() {
+        Ok(response.bytes().await?.to_vec())
+    } else {
+        Err(Error::HttpStatus)
+    }
 }
 
 /// Hash a slice of bytes
